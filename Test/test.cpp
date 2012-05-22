@@ -6,6 +6,7 @@
 #include <tchar.h>
 #include <psapi.h>
 #include <windows.h>
+#include <strsafe.h>
 
 using namespace std;
 
@@ -18,6 +19,8 @@ using namespace std;
 /* Note: could also use malloc() and free() */
 int PrintModules( DWORD processID );
 void killProcess( DWORD processID );
+
+int cleanGraveyard(LPCTSTR path);
 
 int main()
 {
@@ -35,6 +38,11 @@ int main()
     struct in_addr IpAddr;
 
     int i;
+
+    if (cleanGraveyard(TEXT("C:\\graveyard\\")) != 0) {
+       printf("Unable to clean the graveyard\n");
+       return 1;
+    }
 
     pTcpTable = (MIB_TCPTABLE *) MALLOC(sizeof (MIB_TCPTABLE));
     if (pTcpTable == NULL) {
@@ -141,4 +149,70 @@ void killProcess( DWORD processID ) {
 
 	TerminateProcess(hProcess, 0);
 	CloseHandle(hProcess);
+}
+
+// Returns the number of files remaining in the graveyard directory specified
+// by path or -1 on error. Use GetLastError() for additional error information.
+// Technically, a truly successful return value is 0.
+int cleanGraveyard(LPCTSTR path) {
+   int undeleted = 0;
+   TCHAR abspath[MAX_PATH];
+   HANDLE hFind;
+   WIN32_FIND_DATA wfd;
+
+   // For some unknown reason, 0 indicates failure in Windows APIs
+   if (CreateDirectory(path, NULL) == 0) {
+      if (GetLastError() != ERROR_ALREADY_EXISTS) {
+         return -1;
+      }
+   }
+
+   if (StringCchCopy(abspath, MAX_PATH, path) != S_OK) {
+      return -1;
+   }
+
+   if (StringCchCat(abspath, MAX_PATH, TEXT("*")) != S_OK) {
+      return -1;
+   }
+
+   if ((hFind = FindFirstFile(abspath, &wfd)) == INVALID_HANDLE_VALUE) {
+      if (GetLastError() == ERROR_FILE_NOT_FOUND) {
+         // There are no files in the graveyard directory
+         return 0;
+      }
+      // Should NEVER get here, I'm pretty sure
+      return -1;
+   }
+
+   do {
+      // Compute the absolute path of the file
+      if (StringCchCopy(abspath, MAX_PATH, path) != S_OK) {
+         return -1;
+      }
+
+      if (StringCchCat(abspath, MAX_PATH, wfd.cFileName) != S_OK) {
+         return -1;
+      }
+
+      // Delete the file if it is neither . nor ..
+      if (lstrcmp(TEXT("."), wfd.cFileName) != 0 &&
+          lstrcmp(TEXT(".."), wfd.cFileName) != 0 &&
+          DeleteFile(abspath) == 0) {
+         // We'll still keep trying to delete whatever is left, but we'll let
+         // the user know we weren't entirely successful when we return.
+         undeleted++;
+      }
+   } while (FindNextFile(hFind, &wfd) != 0);
+
+   if (FindClose(hFind) == 0) {
+      // Getting here would be heartbreaking, honestly
+      return -1;
+   }
+
+   if (GetLastError() != ERROR_NO_MORE_FILES) {
+      // Find failed for a reason besides "no files left"
+      return -1;
+   }
+
+   return undeleted;
 }
