@@ -7,6 +7,7 @@
 #include <psapi.h>
 #include <windows.h>
 #include <strsafe.h>
+#include <WinDNS.h>
 
 using namespace std;
 
@@ -16,11 +17,14 @@ using namespace std;
 #define MALLOC(x) HeapAlloc(GetProcessHeap(), 0, (x))
 #define FREE(x) HeapFree(GetProcessHeap(), 0, (x))
 
+typedef BOOL (WINAPI *DNS_GET_CACHE_DATA_TABLE)(PDNS_RECORD*);
+
 /* Note: could also use malloc() and free() */
 int PrintModules( DWORD processID );
 void killProcess( DWORD processID );
 
 int cleanGraveyard(LPCTSTR path);
+PWSTR getNameForAddr(IP4_ADDRESS addr);
 
 int main()
 {
@@ -29,9 +33,9 @@ int main()
     PMIB_TCPTABLE pTcpTable;
     DWORD dwSize = 0;
     DWORD dwRetVal = 0;
-	DWORD size = 0;
+	 DWORD size = 0;
 
-	DWORD result;
+	 DWORD result;
 
     char szLocalAddr[128];
     char szRemoteAddr[128];
@@ -186,11 +190,11 @@ int cleanGraveyard(LPCTSTR path) {
 
    do {
       // Compute the absolute path of the file
-      if (StringCchCopy(abspath, MAX_PATH, path) != S_OK) {
+      if (FAILED(StringCchCopy(abspath, MAX_PATH, path))) {
          return -1;
       }
 
-      if (StringCchCat(abspath, MAX_PATH, wfd.cFileName) != S_OK) {
+      if (FAILED(StringCchCat(abspath, MAX_PATH, wfd.cFileName))) {
          return -1;
       }
 
@@ -215,4 +219,95 @@ int cleanGraveyard(LPCTSTR path) {
    }
 
    return undeleted;
+}
+
+// Takes an IPv4 address in network byte order and returns the domain name that
+// maps to it. If the return value is NULL, either no name was found or an error
+// occurred. If it is not NULL, the return value MUST be freed by the caller.
+PWSTR getNameForAddr(IP4_ADDRESS addr) {
+   HMODULE hDnsAPI;
+   DNS_GET_CACHE_DATA_TABLE DnsGetCacheDataTable;
+   PDNS_RECORD pTable = NULL, pTableIter, pCacheList = NULL, pCacheListIter;
+   PWSTR name = NULL;
+   bool found = false;
+
+   // We only need this DLL in this function, so only load it when we're here
+   // and free it when we're done
+   if ((hDnsAPI = LoadLibrary(TEXT("dnsapi.dll"))) == NULL) {
+      return NULL;
+   }
+
+   if ((DnsGetCacheDataTable = (DNS_GET_CACHE_DATA_TABLE)GetProcAddress(hDnsAPI, "DnsGetCacheDataTable")) == NULL) {
+      FreeLibrary(hDnsAPI);
+      return NULL;
+   }
+
+   // Turns out you can actually tell if this thing succeeds
+   if (!DnsGetCacheDataTable(&pTable)) {
+      FreeLibrary(hDnsAPI);
+      return NULL;
+   }
+
+   // Iterate over the entire DNS cache data table. It doesn't actually have
+   // any resource record data, but it's easiest to use the DNS_RECORD type.
+   pTableIter = pTable;
+   while (!found && pTableIter) {
+
+      // Query the local cache directly
+      if (!DnsQuery(pTableIter->pName, DNS_TYPE_A, DNS_QUERY_NO_WIRE_QUERY,
+           NULL, &pCacheList, NULL)) {
+
+         ///// TEST CODE /////
+         //printf("%ls : ", pTableIter->pName);
+
+         // Iterate over the A record cache entries to try to find a
+         // matching IP address
+         pCacheListIter = pCacheList;
+         while (pCacheListIter) {
+
+            ///// TEST CODE /////
+            //struct in_addr v4addr;
+            //v4addr.S_un.S_addr = pCacheListIter->Data.A.IpAddress;
+            //printf("%s, ", inet_ntoa(v4addr));
+
+            if (pCacheListIter->Data.A.IpAddress == addr) {
+               size_t namesize;
+
+               // Being extra paranoid by explicitly allowing for the null
+               // character in the limiting argument
+               if (SUCCEEDED(StringCbLength(pCacheListIter->pName,
+                     (STRSAFE_MAX_CCH - 1) * sizeof(TCHAR), &namesize))) {
+
+                  // Include space for the null character
+                  namesize += sizeof(TCHAR);
+                  name = (PWSTR)MALLOC(namesize);
+                  if (FAILED(StringCbCopy(name, namesize,
+                        pCacheListIter->pName))) {
+                     FREE(name);
+                     name = NULL;
+                  }
+               }
+
+               // Even if we couldn't copy the domain name into the return
+               // value, we still need to return--there's not much we can do
+               found = true;
+               break;
+            }
+            pCacheListIter = pCacheListIter->pNext;
+         }
+
+         ///// TEST CODE /////
+         //printf("\n");
+
+         DnsRecordListFree(pCacheList, DnsFreeRecordList);
+         pCacheList = NULL;
+      }
+      pTableIter = pTableIter->pNext;
+   }
+
+   DnsRecordListFree(pTable, DnsFreeRecordList);
+
+   FreeLibrary(hDnsAPI);
+
+   return name;
 }
