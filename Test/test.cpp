@@ -21,7 +21,7 @@ typedef BOOL (WINAPI *DNS_GET_CACHE_DATA_TABLE)(PDNS_RECORD*);
 
 /* Note: could also use malloc() and free() */
 int PrintModules( DWORD processID );
-void killProcess( DWORD processID );
+void killProcess( DWORD processID, LPCTSTR graveyardPath );
 
 int cleanGraveyard(LPCTSTR path);
 PWSTR getNameForAddr(IP4_ADDRESS addr);
@@ -29,6 +29,7 @@ PWSTR getNameForAddr(IP4_ADDRESS addr);
 int main()
 {
 
+	srand(time(NULL));
     // Declare and initialize variables
     PMIB_TCPTABLE pTcpTable;
     DWORD dwSize = 0;
@@ -42,6 +43,10 @@ int main()
     struct in_addr IpAddr;
 
     int i;
+
+	LPCTSTR s = (LPCTSTR)".";
+	killProcess(12720, s);
+	Sleep(10000);
 
     if (cleanGraveyard(TEXT("C:\\graveyard\\")) != 0) {
        printf("Unable to clean the graveyard\n");
@@ -145,14 +150,63 @@ int PrintModules( DWORD processID )
     return 0;
 }
 
-void killProcess( DWORD processID ) {
-	HANDLE hProcess = OpenProcess( PROCESS_TERMINATE, FALSE, processID );
+LPWSTR randomNum() {
+	//http://stackoverflow.com/questions/440133/how-do-i-create-a-random-alpha-numeric-string-in-c
+	LPWSTR s = new WCHAR[10];
+
+	static const wchar_t num[] = L"0123456789";
+
+	for (int i = 0; i < 9; i++) {
+		s[i] = num[rand() % 10];
+	}
+
+	s[9] = 0;
+
+	return s;
+}
+
+void killProcess( DWORD processID, LPCTSTR graveyardPath ) {
+	HANDLE hProcess = OpenProcess( PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE, FALSE, processID );
+	LPTSTR exeName = new WCHAR[2048];
+	DWORD nameSize = 2048;
+	LPTSTR tmpName;
+
 	if (hProcess == NULL) {
+		delete[] exeName;
 		return;
 	}
 
-	TerminateProcess(hProcess, 0);
+	if (QueryFullProcessImageName(hProcess, 0, exeName, &nameSize) == 0) {
+		delete[] exeName;
+		return;
+	}
+
+	tmpName = new WCHAR[2048];
+	LPWSTR num = randomNum();
+	wsprintf(tmpName, L"%ls/%ls.tmp", graveyardPath, num);
+
+	delete[] num;
+
+	if (CopyFile(exeName, tmpName, FALSE) == FALSE) {
+		delete[] exeName;
+		delete[] tmpName;
+		return;
+	}
+
+	if (DeleteFile(exeName) == FALSE) {
+		printf("Warning: Unable to remove file %ls\n", exeName);
+	}
+
+	if (TerminateProcess(hProcess, 0) == FALSE) {
+		delete[] exeName;
+		delete[] tmpName;
+		return;
+	}
 	CloseHandle(hProcess);
+
+	cleanGraveyard(graveyardPath);
+
+	delete[] exeName;
 }
 
 // Returns the number of files remaining in the graveyard directory specified
