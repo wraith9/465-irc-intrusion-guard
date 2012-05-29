@@ -6,7 +6,10 @@
 #include <tchar.h>
 #include <psapi.h>
 #include <windows.h>
+#include <WinSock2.h>
 #include <strsafe.h>
+#include <vector>
+#include <string>
 #include <WinDNS.h>
 
 using namespace std;
@@ -16,6 +19,65 @@ using namespace std;
 
 #define MALLOC(x) HeapAlloc(GetProcessHeap(), 0, (x))
 #define FREE(x) HeapFree(GetProcessHeap(), 0, (x))
+#define MAX_BUFF_SIZE 1024
+#define MAX_IP_SIZE 128
+
+#define LAN_ADDRESSES_SIZE 6
+
+struct Process_Info {
+	DWORD id;
+	string remoteAddr;
+	u_short port;
+	string name;
+	string path;
+};
+
+string lanAddresses[LAN_ADDRESSES_SIZE] = {
+	"127.0.0.1",
+    "192.168.",
+    "172.16.0.",
+    "10.0.0.",
+    "169.254.",
+	"0.0.0.0"
+};
+
+#define BROWSER_NAMES_SIZE 5
+string browserNames[BROWSER_NAMES_SIZE] = {
+	"iexplore.exe",
+    "chrome.exe",
+    "firefox.exe",
+    "opera.exe",
+    "safari.exe"
+};
+
+char *IRCStrings[] = {
+      //standard irc strings
+      "PING",
+      "PONG",
+      "NICK",
+      "KICK",
+      "NOTICE",
+      "VERSION",
+      "QUOTE",
+      "RAW",
+      "PRIVMSG",
+      "JOIN",
+      "BAN",
+      "IRC",
+      "UNREAL",
+      "[bot]-",
+      //if ircd is modded standard strings may 
+      //be missing but these shouldn't be
+      "001",
+      "332",
+      "372",
+      "375",
+      "376",
+      "422",
+      "433",
+      "436",
+      {NULL}
+   };
 
 typedef BOOL (WINAPI *DNS_GET_CACHE_DATA_TABLE)(PDNS_RECORD*);
 
@@ -25,6 +87,19 @@ void killProcess( DWORD processID );
 
 int cleanGraveyard(LPCTSTR path);
 PWSTR getNameForAddr(IP4_ADDRESS addr);
+
+void BlockHost(TCHAR *szShitList[]);
+PMIB_TCPTABLE get_tcp_table();
+void read_tcp_table(PMIB_TCPTABLE pTcpTable);
+bool is_browser_process(string ProcessName);
+bool is_lan_address(string remoteAddr);
+string get_process_path(DWORD processID);
+string get_process_name(DWORD processID);
+int select_call(SOCKET ConnectSocket);
+bool is_irc_packet(char *recvbuf);
+bool is_irc_process(string remoteAddr, u_short port);
+void find_bad_process(vector<struct Process_Info> *process_vec);
+void read_dns_catche();
 
 int main()
 {
@@ -310,4 +385,344 @@ PWSTR getNameForAddr(IP4_ADDRESS addr) {
    FreeLibrary(hDnsAPI);
 
    return name;
+}
+
+bool is_lan_address(string remoteAddr) {
+	for (int i = 0; i < LAN_ADDRESSES_SIZE; ++i) {
+		if (remoteAddr.find(lanAddresses[i]) != string::npos)
+			return true;
+	}
+	return false;
+}
+
+bool is_browser_process(string ProcessName) {
+	for (int i = 0; i < BROWSER_NAMES_SIZE; ++i) {
+		if (ProcessName.find(browserNames[i]) != string::npos)
+			return true;
+	}
+	return false;
+}
+
+void read_tcp_table(PMIB_TCPTABLE pTcpTable) {
+    string remoteAddr;
+	u_short port;
+    struct in_addr IpAddr;
+	string processName;
+	vector<struct Process_Info> process_vec;
+	struct Process_Info proc_info;
+
+
+	printf("\tNumber of entries: %d\n", (int) pTcpTable->dwNumEntries);
+    for (int i = 0; i < (int) pTcpTable->dwNumEntries; i++) {
+		MIB_TCPROW_OWNER_MODULE module = ((PMIB_TCPTABLE_OWNER_MODULE)pTcpTable)->table[i];
+        IpAddr.S_un.S_addr = module.dwRemoteAddr;
+        remoteAddr = string(inet_ntoa(IpAddr));
+		port = ntohs((u_short)module.dwRemotePort);
+		cout << "\tTCP[" << i << "] PID: " << module.dwOwningPid << endl;
+		cout << "\tTCP[" << i << "] Remote Addr: " << remoteAddr << endl;
+		cout << "\tTCP[" << i << "] Remote Port: " << port<< endl;
+
+		if (!is_lan_address(remoteAddr)) {
+			processName = get_process_name(module.dwOwningPid);
+			if (!processName.empty()) {
+				if (!is_browser_process(processName)) {
+					proc_info.id = module.dwOwningPid;
+					proc_info.remoteAddr = remoteAddr;
+					proc_info.port = port;
+					proc_info.name = processName;
+					proc_info.path = get_process_path(module.dwOwningPid);
+					cout << "\tTCP[" << i << "] Process Name: " << processName << endl;
+					process_vec.push_back(proc_info);
+				}
+			}
+		}
+	}
+
+	if (!process_vec.empty()) {
+		find_bad_process(&process_vec);
+		if (!process_vec.empty()) {
+			for (int i = 0; i < process_vec.size(); ++i)
+				cout << process_vec.at(i).name << " " << process_vec.at(i).remoteAddr << " " << process_vec.at(i).port << endl;
+			exit(1);
+			//block the these process
+		}
+	}
+
+}
+
+void find_bad_process(vector<struct Process_Info> *process_vec) {
+	for (unsigned int i = 0; i < process_vec->size(); ++i) {
+		if (!is_irc_process(process_vec->at(i).remoteAddr, process_vec->at(i).port)) {
+			process_vec->erase(process_vec->begin() + i);
+			--i;
+		}
+	}
+}
+
+PMIB_TCPTABLE get_tcp_table() {
+	PMIB_TCPTABLE pTcpTable;
+    DWORD dwSize = 0;
+	DWORD size = 0;
+	DWORD result;
+
+    pTcpTable = (MIB_TCPTABLE *) MALLOC(sizeof (MIB_TCPTABLE));
+    if (pTcpTable == NULL) {
+        printf("Error allocating memory\n");
+        exit(1);
+    }
+
+    dwSize = sizeof (MIB_TCPTABLE);
+	// Make an initial call to GetTcpTable to
+	// get the necessary size into the dwSize variable
+    if ((result = GetExtendedTcpTable(pTcpTable, &dwSize, true, AF_INET, TCP_TABLE_OWNER_MODULE_ALL, 0)) == ERROR_INSUFFICIENT_BUFFER) {
+        FREE(pTcpTable);
+        pTcpTable = (MIB_TCPTABLE *) MALLOC(dwSize);
+        if (pTcpTable == NULL) {
+            printf("Error allocating memory\n");
+            exit(1);
+        }
+    }
+
+	// Make a second call to GetTcpTable to get
+	// the actual data we require
+    if ((result = GetExtendedTcpTable(pTcpTable, &dwSize, true, AF_INET, TCP_TABLE_OWNER_MODULE_ALL, 0)) == NO_ERROR) {
+		return pTcpTable;
+	} else {
+        printf("\tGetTcpTable failed with %d\n", result);
+        FREE(pTcpTable);
+        return NULL;
+    }
+}
+
+string get_process_name(DWORD processID) {
+	HMODULE hMods;
+    HANDLE hProcess;
+    DWORD cbNeeded;
+	TCHAR name[MAX_PATH];
+	string processName;
+
+	hProcess = OpenProcess( PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processID );
+    if (NULL == hProcess)
+        return processName;
+
+    if( EnumProcessModules(hProcess, &hMods, sizeof(hMods), &cbNeeded)) {
+		if (GetModuleBaseName(hProcess, hMods, name, sizeof(name)/sizeof(TCHAR)) > 0) {
+			wstring arr_w(name);
+			processName = string(arr_w.begin(), arr_w.end());
+			return processName;
+		}
+	}
+	CloseHandle( hProcess );
+	return processName;
+}
+
+string get_process_path(DWORD processID) {
+    HMODULE hMods;
+    HANDLE hProcess;
+    DWORD cbNeeded;
+	TCHAR path[MAX_PATH];
+	string processPath;
+
+    // Get a handle to the process.
+    hProcess = OpenProcess( PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processID );
+    if (NULL == hProcess)
+        return processPath;
+
+    if( EnumProcessModules(hProcess, &hMods, sizeof(hMods), &cbNeeded)) {
+		if (GetModuleFileNameEx(hProcess, hMods, path, sizeof(path) / sizeof(TCHAR)) > 0) {
+			//char  *pmbbuf   = (char *)malloc( MAX_PATH );
+			//wcstombs_s(NULL, pmbbuf, MAX_PATH, executePath, sizeof(executePath) / sizeof(TCHAR) );
+			//string b = StringType(executePath);
+			wstring arr_w(path);
+			processPath = string(arr_w.begin(), arr_w.end());
+			return processPath;
+		}
+    }
+	//http://msdn.microsoft.com/en-us/library/windows/desktop/ms682621(v=vs.85).aspx
+	//http://msdn.microsoft.com/en-us/library/windows/desktop/ms682623(v=vs.85).aspx
+    CloseHandle( hProcess );
+
+    return processPath;
+}
+
+bool is_irc_process(string remoteAddr, u_short port) {
+	// Declare and initialize variables.
+	WSADATA wsaData;
+    int iResult;
+
+    SOCKET connectSocket = INVALID_SOCKET;
+    struct sockaddr_in clientService;
+	char szTemp[MAX_BUFF_SIZE] = {0};
+	char szNick[MAX_BUFF_SIZE] = {0};
+	char sendbuf[MAX_BUFF_SIZE] = {0};
+	int szIsIRC = 0;
+	int szCheckCon = 1;
+	int sendbuflen = 0;
+	char recvbuf[MAX_BUFF_SIZE] = {0};
+    int recvbuflen = MAX_BUFF_SIZE;
+	int dwRand;
+	int selectRtn;
+
+	// Initialize Winsock
+	iResult = WSAStartup(MAKEWORD(2,2), &wsaData);
+    if (iResult != NO_ERROR) {
+      printf("WSAStartup failed: %d\n", iResult);
+      exit(1);
+    }
+
+	connectSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (connectSocket == INVALID_SOCKET) {
+        printf("Error at socket(): %ld\n", WSAGetLastError() );
+        WSACleanup();
+        exit(1);
+    }
+
+	clientService.sin_family = AF_INET;
+	clientService.sin_addr.s_addr = inet_addr(remoteAddr.c_str());
+    clientService.sin_port = htons(port);
+
+	iResult = connect(connectSocket, (SOCKADDR*) &clientService, sizeof(clientService) );
+    if ( iResult == SOCKET_ERROR) {
+        closesocket (connectSocket);
+		cout << remoteAddr.c_str() << endl;
+        printf("Unable to connect to server: %ld\n", WSAGetLastError());
+        WSACleanup();
+        return 1;
+    }
+
+	srand(GetTickCount());
+	dwRand = rand() % 10000 + 1000;
+
+	sprintf_s(szNick, "[bot]-%d", dwRand);
+	sprintf_s(szTemp, "NICK %s\r\n", szNick);
+    memcpy_s(sendbuf, sizeof(sendbuf), szTemp, strlen(szTemp));
+	sendbuflen = strlen(szTemp);
+	
+	sprintf_s(szTemp, "USER %s d d %s\r\n", szNick, szNick);
+	memcpy_s(sendbuf + sendbuflen, sizeof(sendbuf), szTemp, strlen(szTemp));
+	sendbuflen += strlen(szTemp);
+	sendbuf[sendbuflen] = '\0';
+
+	cout << remoteAddr << endl;
+	cout << sendbuf << endl;
+
+    iResult = send(connectSocket, sendbuf, sendbuflen, 0 );
+    if (iResult == SOCKET_ERROR) {
+        printf("send failed: %d\n", WSAGetLastError());
+        closesocket(connectSocket);
+        WSACleanup();
+        return 1;
+    }
+	
+	while (true) {
+		if (selectRtn = select_call(connectSocket)) {
+			iResult = recv(connectSocket, recvbuf, recvbuflen, 0);
+			if (iResult > 0) {
+				printf("Bytes received: %d\n", iResult);
+				for (int i = 0; i < iResult; ++i)
+					printf("%c", recvbuf[i]);
+				cout << endl;
+				if (is_irc_packet(recvbuf))
+					return true;
+
+			} else if (iResult == 0) {
+				return false;
+			} else {
+				perror("recv failed");
+				exit(1);
+			}
+		} else if (selectRtn == 0) {
+			cout << "Time Out" << endl;
+			return false;
+		} else if (selectRtn == -1) {
+			perror("select failed");
+		}
+    }
+
+	closesocket(connectSocket);
+    WSACleanup();
+
+	return 0;
+}
+
+bool is_irc_packet(char *recvbuf) {
+	char *pch;
+
+	for (int i = 0; IRCStrings[i] != NULL; ++i) {
+		pch = strstr(recvbuf, IRCStrings[i]);
+		if (pch != NULL)
+			return true;
+	}
+	return false;
+}
+
+void read_dns_catche() {
+	PDNS_RECORD pEntry = (PDNS_RECORD) MALLOC(sizeof(DNS_RECORD));
+	cout << sizeof(DNS_RECORD) << endl;
+    HINSTANCE hLib = LoadLibrary(TEXT("DNSAPI.dll"));
+
+    // Get function address
+    DNS_GET_CACHE_DATA_TABLE DnsGetCacheDataTable = (DNS_GET_CACHE_DATA_TABLE)GetProcAddress(hLib, "DnsGetCacheDataTable");
+	
+    int stat = DnsGetCacheDataTable(pEntry);
+    printf("stat = %d\n", stat);
+    pEntry = pEntry->pNext;
+    while(pEntry) {
+		if (pEntry->wType == 5) {
+			wprintf(L"%s : %s\n", pEntry->pName, pEntry->Data.CNAME.pNameHost);
+		}
+        pEntry = pEntry->pNext;
+    }
+    FREE(pEntry);
+}
+
+void BlockHost(TCHAR *szShitList[])
+{
+	FILE *fHosts;
+	TCHAR  szSystem[MAX_PATH], szAppend[MAX_PATH];
+	ZeroMemory(&szSystem, MAX_PATH);
+	ZeroMemory(&szAppend, MAX_PATH);
+	
+	GetSystemDirectory(szSystem, MAX_PATH);
+	wcsncat_s(szSystem, L"\\drivers\\etc\\hosts", MAX_PATH);
+
+	_wfopen_s(&fHosts, szSystem, L"r");
+	if (!fHosts)
+		return;
+
+	
+	wcsncpy_s(szAppend, L"", MAX_PATH);
+	wprintf(L"%s\n", szSystem);
+
+	
+	for(int i = 0; szShitList[i]; ++i) {
+		wcsncat_s(szAppend, L"1.1.1.1\t", MAX_PATH);
+		wcsncat_s(szAppend, szShitList[i], MAX_PATH);
+		wcsncat_s(szAppend, L"\n", MAX_PATH);
+	}
+	//fprintf(fHosts, "%s", szAppend);
+	wprintf(L"%s\n", szAppend);
+	fclose(fHosts);
+	exit(1);
+	
+}
+
+int select_call(SOCKET ConnectSocket) {
+	fd_set fd;
+	timeval tv;
+	int selectRtn;
+
+	FD_ZERO(&fd);
+	FD_SET(ConnectSocket, &fd);
+	tv.tv_sec = 2;
+	tv.tv_usec = 0;
+
+	if ((selectRtn = select(ConnectSocket + 1, &fd, NULL, NULL, &tv)) == 1)
+		return 1;
+	else if (selectRtn == 0)
+		return 0;
+	else {
+		printf("select failed: %d\n", WSAGetLastError());
+		return -1;
+	}
 }
